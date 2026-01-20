@@ -121,7 +121,8 @@ class PoPE(Module):
     @autocast('cuda', enabled = False)
     def forward(
         self,
-        pos_or_seq_len: Tensor | int
+        pos_or_seq_len: Tensor | int,
+        offset = 0
     ):
 
         # get positions depending on input
@@ -131,6 +132,8 @@ class PoPE(Module):
         else:
             seq_len = pos_or_seq_len
             pos = arange(seq_len, device = self.device, dtype = self.inv_freqs.dtype)
+
+        pos = pos + offset
 
         # freqs
 

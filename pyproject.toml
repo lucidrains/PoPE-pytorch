@@ -1,6 +1,6 @@
 [project]
 name = "PoPE-pytorch"
-version = "0.0.4"
+version = "0.0.5"
 description = "PoPE"
 authors = [
     { name = "Phil Wang", email = "lucidrains@gmail.com" }
