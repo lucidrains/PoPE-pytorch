@@ -31,7 +31,8 @@ def default(v, d):
 def apply_pope_to_qk(
     pope: PolarEmbedReturn,
     q, k,
-    to_magnitude = F.softplus
+    to_magnitude = F.softplus,
+    return_complex = False
 ):
     freqs, bias = pope
 
@@ -45,10 +46,14 @@ def apply_pope_to_qk(
         q, q_rest = q[..., :rotate_dim], q[..., -rotate_dim:]
         k, k_rest = k[..., :rotate_dim], k[..., -rotate_dim:]
 
+        if return_complex:
+            q_rest = torch.polar(q_rest, torch.zeros_like(q_rest))
+            k_rest = torch.polar(k_rest, torch.zeros_like(k_rest))
+
     if freqs.ndim == 3:
         freqs = rearrange(freqs, 'b n d -> b 1 n d')
 
-    freq_with_bias = freqs + rearrange(bias, 'h d -> h 1 d')
+    freqs_with_bias = freqs + rearrange(bias, 'h d -> h 1 d')
 
     # convert q and k to polar magnitudes with activation
 
@@ -58,15 +63,19 @@ def apply_pope_to_qk(
 
     freqs = slice_right_at_dim(freqs, q_len, dim = -2)
 
-    qcos, qsin = freqs.cos(), freqs.sin()
-
-    q = rearrange([q * qcos, q * qsin], 'two ... d -> ... (d two)')
+    if return_complex:
+        q = torch.polar(q, freqs)
+    else:
+        qcos, qsin = freqs.cos(), freqs.sin()
+        q = rearrange([q * qcos, q * qsin], 'two ... d -> ... (d two)')
 
     # handle inference
 
-    kcos, ksin = freq_with_bias.cos(), freq_with_bias.sin()
-
-    k = rearrange([k * kcos, k * ksin], 'two ... d -> ... (d two)')
+    if return_complex:
+        k = torch.polar(k, freqs_with_bias)
+    else:
+        kcos, ksin = freqs_with_bias.cos(), freqs_with_bias.sin()
+        k = rearrange([k * kcos, k * ksin], 'two ... d -> ... (d two)')
 
     # concat
 
