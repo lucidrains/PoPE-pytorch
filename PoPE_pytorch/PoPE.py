@@ -43,8 +43,8 @@ def apply_pope_to_qk(
     is_partial_rotate = rotate_dim < qk_dim
 
     if is_partial_rotate:
-        q, q_rest = q[..., :rotate_dim], q[..., -rotate_dim:]
-        k, k_rest = k[..., :rotate_dim], k[..., -rotate_dim:]
+        q, q_rest = q[..., :rotate_dim], q[..., rotate_dim:]
+        k, k_rest = k[..., :rotate_dim], k[..., rotate_dim:]
 
         if return_complex:
             q_rest = torch.polar(q_rest, torch.zeros_like(q_rest))
