@@ -111,9 +111,11 @@ def _bwd_kernel_dqk_df(
     if MODE == 0:
         off_outer = grid_idx * BLOCK_I + tl.arange(0, BLOCK_I)
         mask_outer = off_outer < seq_q
+
         for d_offset in range(0, head_dim, BLOCK_D):
             d_mask = (d_offset + off_d) < head_dim
             rotate_mask = (d_offset + off_d) < rotate_dim
+
             acc_dq = tl.zeros((BLOCK_I, BLOCK_D), dtype = tl.float32)
             acc_df = tl.zeros((BLOCK_I, BLOCK_D), dtype = tl.float32)
             
@@ -127,6 +129,7 @@ def _bwd_kernel_dqk_df(
             for j_start in range(0, seq_k, BLOCK_J):
                 off_inner = j_start + tl.arange(0, BLOCK_J)
                 mask_inner = off_inner < seq_k
+
                 ds = tl.load(dS + batch_idx * stride_sb + head_idx * stride_sh + off_outer[:, None] * stride_si + off_inner[None, :] * stride_sj, mask = mask_outer[:, None] & mask_inner[None, :], other = 0.0)
                 ik = tl.load(K + batch_idx * stride_kb + head_idx * stride_kh + off_inner[:, None] * stride_kj + (d_offset + off_d[None, :]) * stride_kd, mask = mask_inner[:, None] & d_mask[None, :], other = 0.0)
                 ifk = tl.load(Freqs + batch_idx * stride_fb + head_idx * stride_fh + off_inner[:, None] * stride_fi + (d_offset + off_d[None, :]) * stride_fd, mask = mask_inner[:, None] & rotate_mask[None, :], other = 0.0)
@@ -150,9 +153,11 @@ def _bwd_kernel_dqk_df(
     else: # MODE == 1
         off_outer = grid_idx * BLOCK_J + tl.arange(0, BLOCK_J)
         mask_outer = off_outer < seq_k
+
         for d_offset in range(0, head_dim, BLOCK_D):
             d_mask = (d_offset + off_d) < head_dim
             rotate_mask = (d_offset + off_d) < rotate_dim
+
             acc_dk = tl.zeros((BLOCK_J, BLOCK_D), dtype = tl.float32)
             acc_df = tl.zeros((BLOCK_J, BLOCK_D), dtype = tl.float32)
             
@@ -169,6 +174,7 @@ def _bwd_kernel_dqk_df(
             for inner_start in range(0, seq_q, BLOCK_I):
                 off_inner = inner_start + tl.arange(0, BLOCK_I)
                 mask_inner = off_inner < seq_q
+
                 ds = tl.load(dS + batch_idx * stride_sb + head_idx * stride_sh + off_inner[:, None] * stride_si + off_outer[None, :] * stride_sj, mask = mask_inner[:, None] & mask_outer[None, :], other = 0.0)
                 iq = tl.load(Q + batch_idx * stride_qb + head_idx * stride_qh + off_inner[:, None] * stride_qi + (d_offset + off_d[None, :]) * stride_qd, mask = mask_inner[:, None] & d_mask[None, :], other = 0.0)
                 ifq = tl.load(Freqs + batch_idx * stride_fb + (head_idx % n_heads) * stride_fh + (q_offset + off_inner[:, None]) * stride_fi + (d_offset + off_d[None, :]) * stride_fd, mask = mask_inner[:, None] & rotate_mask[None, :], other = 0.0)
@@ -201,8 +207,10 @@ def _bwd_kernel_dbias_optimized(
 ):
     batch_head_idx = tl.program_id(0)
     i_block_idx = tl.program_id(1)
+
     batch_idx = batch_head_idx // n_heads
     head_idx = batch_head_idx % n_heads
+
     off_i = i_block_idx * BLOCK_I + tl.arange(0, BLOCK_I)
     mask_i = off_i < seq_q
     off_d = tl.arange(0, BLOCK_D)
@@ -225,6 +233,7 @@ def _bwd_kernel_dbias_optimized(
         for j_start in range(0, seq_k, BLOCK_J):
             off_j = j_start + tl.arange(0, BLOCK_J)
             mask_j = off_j < seq_k
+
             ds = tl.load(dS + batch_idx * stride_sb + head_idx * stride_sh + off_i[:, None] * stride_si + off_j[None, :] * stride_sj, mask = mask_i[:, None] & mask_j[None, :], other = 0.0)
             ik = tl.load(K + batch_idx * stride_kb + head_idx * stride_kh + off_j[:, None] * stride_kj + (d_offset + off_d[None, :]) * stride_kd, mask = mask_j[:, None] & d_mask[None, :], other = 0.0)
             ifk = tl.load(Freqs + batch_idx * stride_fb + (head_idx % n_heads) * stride_fh + off_j[:, None] * stride_fi + (d_offset + off_d[None, :]) * stride_fd, mask = mask_j[:, None] & rotate_mask[None, :], other = 0.0)
@@ -354,7 +363,8 @@ class PoPESimilarityFunction(torch.autograd.Function):
 
 def triton_compute_qk_similarity(q, k, freqs, bias, rotate_dim, allow_tf32 = True):
 
-    assert divisible_by(q.shape[-1], k.shape[1])
+    assert divisible_by(q.shape[1], k.shape[1])
+
     groups = q.shape[1] // k.shape[1]
     k = repeat(k, 'b h ... -> b (g h) ...', g = groups)
     bias = repeat(bias, 'h ... -> (g h) ...', g = groups)

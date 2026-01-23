@@ -1,11 +1,16 @@
 import torch
 import torch.nn.functional as F
 import pytest
+
 from PoPE_pytorch.pope import PoPE
 from PoPE_pytorch.attention import compute_attn_similarity, compute_attn_similarity_non_fused
 
+# helpers
+
 def exists(v):
     return v is not None
+
+# tests
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason = 'CUDA not available')
 def test_triton_multi_config():
@@ -35,7 +40,8 @@ def test_triton_multi_config():
         db_ref = pope.bias.grad.clone() if exists(pope) and exists(pope.bias.grad) else None
         
         q.grad.zero_(), k.grad.zero_()
-        if exists(pope) and exists(pope.bias.grad): pope.bias.grad.zero_()
+        if exists(pope) and exists(pope.bias.grad):
+            pope.bias.grad.zero_()
         
         # Triton
         sim_triton = compute_attn_similarity(q, k, pos_embed, allow_tf32 = False)
@@ -43,6 +49,7 @@ def test_triton_multi_config():
         
         assert torch.allclose(dq_ref, q.grad, rtol = 1e-3, atol = 1e-4)
         assert torch.allclose(dk_ref, k.grad, rtol = 1e-3, atol = 1e-4)
+
         if exists(db_ref):
              assert torch.allclose(db_ref, pope.bias.grad, rtol = 1e-3, atol = 1e-4)
 
