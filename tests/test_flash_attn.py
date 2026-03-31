@@ -1,11 +1,8 @@
 import torch
 import pytest
-from PoPE_pytorch import PoPE
+from PoPE_pytorch import PoPE, exists
 from PoPE_pytorch.attention import flash_attn_with_pope, compute_attn_similarity
 from einops import rearrange
-
-def exists(v):
-    return v is not None
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason = 'CUDA must be available')
 @pytest.mark.parametrize('dtype', [torch.float16, torch.bfloat16, torch.float32])

@@ -1,14 +1,8 @@
 import torch
-import torch.nn.functional as F
 import pytest
 
-from PoPE_pytorch.pope import PoPE
+from PoPE_pytorch.pope import PoPE, exists
 from PoPE_pytorch.attention import compute_attn_similarity, compute_attn_similarity_non_fused
-
-# helpers
-
-def exists(v):
-    return v is not None
 
 # tests
 

@@ -1,21 +1,11 @@
 import torch
 import torch.nn.functional as F
 
+from PoPE_pytorch import default, divisible_by, exists
 from PoPE_pytorch.pope import apply_pope_to_qk
 
 from torch_einops_utils import and_masks
 from einops import rearrange, repeat
-
-# helpers
-
-def exists(v):
-    return v is not None
-
-def default(v, d):
-    return v if exists(v) else d
-
-def divisible_by(num, den):
-    return (num % den) == 0
 
 # triton available
 

@@ -5,13 +5,7 @@ import triton.language as tl
 
 from einops import repeat
 
-# helpers
-
-def exists(v):
-    return v is not None
-
-def divisible_by(num, den):
-    return (num % den) == 0
+from PoPE_pytorch import default, exists
 
 # activation
 

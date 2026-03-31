@@ -6,13 +6,7 @@ from torch.autograd import Function
 import triton
 import triton.language as tl
 
-# helpers
-
-def exists(v):
-    return v is not None
-
-def default(v, d):
-    return v if exists(v) else d
+from PoPE_pytorch import default, exists
 
 # autotuning
 
