@@ -1,106 +1,100 @@
 from __future__ import annotations
+
 from math import pi
 
 import torch
-from torch import arange, cat, stack, is_tensor, Tensor, meshgrid
+from einops import einsum
+from hunterMakesPy import raiseIfNone
+from torch import Tensor, arange, cat, meshgrid, stack
+from torch._prims_common import DeviceLikeType
+from torch.amp.autocast_mode import autocast
 from torch.nn import Module, Parameter, ParameterList
-from torch.amp import autocast
+from torch.types import Number
+from torch_einops_kit import exists
 
-from einops import einsum, rearrange
+from PoPE_pytorch import PolarEmbedReturn
+from PoPE_pytorch.pope import apply_pope_to_qk
 
-from PoPE_pytorch.pope import PolarEmbedReturn, apply_pope_to_qk
-
-# helper functions
-
-def exists(v):
-    return v is not None
-
-def default(v, d):
-    return v if exists(v) else d
-
-# Axial PoPE class
 
 class AxialPoPE(Module):
-    # convenience
-    apply_pope_to_qk = staticmethod(apply_pope_to_qk)
 
-    def __init__(
-        self,
-        dim,
-        *,
-        heads,
-        axial_dims: tuple[int, ...] | None = None,
-        theta = 10000,
-        bias_uniform_init = False,
-    ):
-        super().__init__()
-        self.dim = dim
-        self.heads = heads
+	apply_pope_to_qk = staticmethod(apply_pope_to_qk)
 
-        if not exists(axial_dims):
-            axial_dims = (dim,)
+	def __init__(
+		self, dim: int, *, heads: int, axial_dims: tuple[int, ...] | None = None, theta: float = 10000, bias_uniform_init: bool = False
+	) -> None:
+		super().__init__()
+		self.dim: int = dim
+		self.heads: int = heads
 
-        self.axial_dims = axial_dims
-        assert sum(axial_dims) == dim, f'sum of axial_dims {axial_dims} must be equal to dim {dim}'
+		if not exists(axial_dims):
+			axial_dims = (dim,)
 
-        # inv freqs for each axial dimension
+		self.axial_dims: tuple[int, ...] = raiseIfNone(axial_dims)
+		if sum(self.axial_dims) != dim:
+			message: str = f'I received `{self.axial_dims = }` and `{dim = }`, but I need `sum(self.axial_dims) == dim`.'
+			raise ValueError(message)
 
-        self.inv_freqs = ParameterList()
+		# inv freqs for each axial dimension
 
-        for axial_dim in axial_dims:
-            inv_freqs = theta ** -(arange(axial_dim).float() / axial_dim)
-            self.inv_freqs.append(Parameter(inv_freqs, requires_grad = False))
+		self.inv_freqs = ParameterList()
 
-        # the learned bias on the keys
+		for axial_dim in self.axial_dims:
+			inv_freqs = theta ** -(arange(axial_dim).float() / axial_dim)
+			self.inv_freqs.append(Parameter(inv_freqs, requires_grad=False))
 
-        self.bias = Parameter(torch.zeros(heads, dim))
+		# the learned bias on the keys
 
-        if bias_uniform_init:
-            self.bias.uniform_(-2. * pi, 0.)
+		self.bias = Parameter(torch.zeros(heads, dim))
 
-    @property
-    def device(self):
-        return self.bias.device
+		if bias_uniform_init:
+			self.bias.uniform_(-2.0 * pi, 0.0)
 
-    @staticmethod
-    def get_grid_positions(*dims, device = None):
-        grid = meshgrid(*[arange(d, device = device).float() for d in dims], indexing = 'ij')
-        return stack([g.flatten() for g in reversed(grid)], dim = -1)
+	@property
+	def device(self) -> torch.device:
+		return self.bias.device
 
-    @autocast('cuda', enabled = False)
-    def forward(
-        self,
-        pos_or_dims: Tensor | tuple[int, ...],
-    ):
-        # handle auto grid generation if tuple is passed
+	@staticmethod
+	def get_grid_positions(*dims: Number, device: DeviceLikeType | None = None) -> Tensor:
+		grid: tuple[Tensor, ...] = meshgrid(*[arange(d, device=device).float() for d in dims], indexing='ij')
+		return stack([g.flatten() for g in reversed(grid)], dim=-1)
 
-        if isinstance(pos_or_dims, tuple):
-            pos = self.get_grid_positions(*pos_or_dims, device = self.device)
-        else:
-            pos = pos_or_dims
+	@autocast('cuda', enabled=False)
+	def forward(self, pos_or_dims: Tensor | tuple[int, ...]) -> PolarEmbedReturn:
+		# handle auto grid generation if tuple is passed
 
-        # pos shape is (..., N) where N is len(axial_dims)
+		if isinstance(pos_or_dims, tuple):
+			pos: Tensor = self.get_grid_positions(*pos_or_dims, device=self.device)
+		else:
+			pos = pos_or_dims
 
-        assert pos.shape[-1] == len(self.axial_dims)
+		# pos shape is (..., N) where N is len(axial_dims)
 
-        all_freqs = []
+		if pos.shape[-1] != len(self.axial_dims):
+			message: str = (
+				f'I received `{pos.shape[-1] = }` and `{len(self.axial_dims) = }`, '
+				'but I need `pos.shape[-1] == len(self.axial_dims)`.'
+			)
+			raise ValueError(message)
 
-        for i, inv_freqs in enumerate(self.inv_freqs):
-            # pos_i shape is (...)
+		all_freqs: list[Tensor] = []
 
-            pos_i = pos[..., i]
+		for i, inv_freqs in enumerate(self.inv_freqs):
+			# pos_i shape is (...)
 
-            # freqs_i shape is (..., axial_dim)
+			pos_i: Tensor = pos[..., i]
 
-            freqs_i = einsum(pos_i, inv_freqs, '... , d -> ... d')
-            all_freqs.append(freqs_i)
+			# freqs_i shape is (..., axial_dim)
 
-        # concat axial freqs
+			freqs_i: Tensor = einsum(pos_i, inv_freqs, '... , d -> ... d')
+			all_freqs.append(freqs_i)
 
-        freqs = cat(all_freqs, dim = -1)
+		# concat axial freqs
 
-        # the bias, with clamping
+		freqs: Tensor = cat(all_freqs, dim=-1)
 
-        bias = self.bias.clamp(-2. * pi, 0.)
+		# the bias, with clamping
 
-        return PolarEmbedReturn(freqs, bias)
+		bias: Tensor = self.bias.clamp(-2.0 * pi, 0.0)
+
+		return PolarEmbedReturn(freqs, bias)

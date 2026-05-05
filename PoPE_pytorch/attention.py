@@ -1,165 +1,152 @@
+from __future__ import annotations
+
 import torch
 import torch.nn.functional as F
+from einops import rearrange, repeat
+from torch import Tensor
+from torch_einops_kit import and_masks, default, divisible_by, exists
 
+from PoPE_pytorch import PolarEmbedReturn
 from PoPE_pytorch.pope import apply_pope_to_qk
 
-from torch_einops_utils import and_masks
-from einops import rearrange, repeat
-
-# helpers
-
-def exists(v):
-    return v is not None
-
-def default(v, d):
-    return v if exists(v) else d
-
-def divisible_by(num, den):
-    return (num % den) == 0
-
-# triton available
-
 try:
-    from .triton_pope import triton_compute_qk_similarity
-    from .triton_pope_flash_attn import flash_attn
-    TRITON_AVAILABLE = True
+	from .triton_pope import triton_compute_qk_similarity
+	from .triton_pope_flash_attn import flash_attn
+
+	TRITON_AVAILABLE = True
 except ImportError:
-    TRITON_AVAILABLE = False
+	TRITON_AVAILABLE = False
 
-# functions
+def compute_attn_similarity_non_fused(q: Tensor, k: Tensor, pope: PolarEmbedReturn, *, head_dimension_at_first: bool = True) -> Tensor:
 
-def compute_attn_similarity_non_fused(
-    q,
-    k,
-    pope,
-    head_dimension_at_first = True
-):
-    if not head_dimension_at_first:
-        q = rearrange(q, 'b n h d -> b h n d')
-        k = rearrange(k, 'b n h d -> b h n d')
+	if not head_dimension_at_first:
+		q = rearrange(q, 'b n h d -> b h n d')
+		k = rearrange(k, 'b n h d -> b h n d')
 
-    q, k = apply_pope_to_qk(pope, q, k, to_magnitude = F.softplus)
+	q, k = apply_pope_to_qk(pope, q, k, to_magnitude=F.softplus)
 
-    # group query attention support
+	# group query attention support
 
-    groups = q.shape[1] // k.shape[1]
-    k = repeat(k, 'b h ... -> b (g h) ...', g = groups)
+	groups = q.shape[1] // k.shape[1]
+	k = repeat(k, 'b h ... -> b (g h) ...', g=groups)
 
-    return torch.einsum('b h i d, b h j d -> b h i j', q, k)
+	return torch.einsum('b h i d, b h j d -> b h i j', q, k)
 
 def compute_attn_similarity(
-    q,
-    k,
-    pope,
-    allow_tf32 = True,
-    head_dimension_at_first = True
-):
-    assert divisible_by(q.shape[1 if head_dimension_at_first else 2], k.shape[1 if head_dimension_at_first else 2])
+	q: Tensor, k: Tensor, pope: PolarEmbedReturn, *, allow_tf32: bool = True, head_dimension_at_first: bool = True
+) -> Tensor:
 
-    freqs, bias = pope
-    head_dim = q.shape[-1]
+	q_heads: int = q.shape[1 if head_dimension_at_first else 2]
+	k_heads: int = k.shape[1 if head_dimension_at_first else 2]
+	if not divisible_by(q_heads, k_heads):
+		message: str = f"I received `{q_heads = }` and `{k_heads = }`, but I need `q_heads` to be divisible by `k_heads` for grouped-query attention."
+		raise ValueError(message)
 
-    assert head_dim in {32, 48, 64, 128, 256}, f"head_dim {head_dim} not in common sizes"
+	freqs, bias = pope
+	head_dim: int = q.shape[-1]
 
-    is_cuda = q.is_cuda and k.is_cuda and freqs.is_cuda and bias.is_cuda
+	common_head_dims: tuple[int, ...] = (32, 48, 64, 128, 256)
+	if head_dim not in common_head_dims:
+		message: str = f"I received `{head_dim = }`, but I need `head_dim` to be one of `{common_head_dims = }` for the Triton kernel family."
+		raise ValueError(message)
 
-    if TRITON_AVAILABLE and is_cuda:
-        if not head_dimension_at_first:
-            q = rearrange(q, 'b n h d -> b h n d')
-            k = rearrange(k, 'b n h d -> b h n d')
+	is_cuda: bool = q.is_cuda and k.is_cuda and freqs.is_cuda and bias.is_cuda
 
-        rotate_dim = freqs.shape[-1]
-        return triton_compute_qk_similarity(q, k, freqs, bias, rotate_dim, allow_tf32 = allow_tf32)
+	if TRITON_AVAILABLE and is_cuda:
+		if not head_dimension_at_first:
+			q = rearrange(q, 'b n h d -> b h n d')
+			k = rearrange(k, 'b n h d -> b h n d')
 
-    return compute_attn_similarity_non_fused(q, k, pope, head_dimension_at_first = head_dimension_at_first)
+		rotate_dim: int = freqs.shape[-1]
+		return triton_compute_qk_similarity(q, k, freqs, bias, rotate_dim, allow_tf32=allow_tf32)
+
+	return compute_attn_similarity_non_fused(q, k, pope, head_dimension_at_first=head_dimension_at_first)
 
 def flash_attn_with_pope(
-    q,
-    k,
-    v,
-    pos_emb = None,
-    mask = None,
-    causal = False,
-    softmax_scale = None,
-    fused = None,
-    head_dimension_at_first = True,
-    dropout = 0.
-):
-    seq_dim = 2 if head_dimension_at_first else 1
-    q_len, kv_len, device = q.shape[seq_dim], k.shape[seq_dim], q.device
+	q: Tensor,
+	k: Tensor,
+	v: Tensor,
+	pos_emb: PolarEmbedReturn,
+	*,
+	mask: Tensor | None = None,
+	causal: bool = False,
+	softmax_scale: float | None = None,
+	fused: bool | None = None,
+	head_dimension_at_first: bool = True,
+	dropout: float = 0.0,
+) -> Tensor:
 
-    fused = default(fused, TRITON_AVAILABLE and q.is_cuda)
+	seq_dim: int = 2 if head_dimension_at_first else 1
+	q_len, kv_len, device = q.shape[seq_dim], k.shape[seq_dim], q.device
 
-    softmax_scale = default(softmax_scale, q.shape[-1] ** -0.5)
+	fused = default(fused, TRITON_AVAILABLE and q.is_cuda)
 
-    if fused:
-        # fused kernel expects (batch, seq, heads, dim)
+	softmax_scale = default(softmax_scale, q.shape[-1] ** -0.5)
 
-        if head_dimension_at_first:
-            q = rearrange(q, 'b h n d -> b n h d')
-            k = rearrange(k, 'b h n d -> b n h d')
-            v = rearrange(v, 'b h n d -> b n h d')
+	if fused:
+		# fused kernel expects (batch, seq, heads, dim)
 
-        freqs, bias = pos_emb
-        out = flash_attn(q, k, v, freqs = freqs, pope_bias = bias, mask = mask, causal = causal, softmax_scale = softmax_scale, dropout = dropout)
+		if head_dimension_at_first:
+			q = rearrange(q, 'b h n d -> b n h d')
+			k = rearrange(k, 'b h n d -> b n h d')
+			v = rearrange(v, 'b h n d -> b n h d')
 
-        if head_dimension_at_first:
-            out = rearrange(out, 'b n h d -> b h n d')
+		freqs, bias = pos_emb
+		out: Tensor = flash_attn(
+			q, k, v, freqs=freqs, pope_bias=bias, mask=mask, causal=causal, softmax_scale=softmax_scale, dropout=dropout
+		)
 
-        return out
+		if head_dimension_at_first:
+			out = rearrange(out, 'b n h d -> b h n d')
 
-    # non-fused manual path
-    # standardize to (batch, heads, seq, dim)
+		return out
 
-    if not head_dimension_at_first:
-        q = rearrange(q, 'b n h d -> b h n d')
-        k = rearrange(k, 'b n h d -> b h n d')
-        v = rearrange(v, 'b n h d -> b h n d')
+	# non-fused manual path
+	# standardize to (batch, heads, seq, dim)
 
-    q, k = apply_pope_to_qk(pos_emb, q, k, to_magnitude = F.softplus)
+	if not head_dimension_at_first:
+		q = rearrange(q, 'b n h d -> b h n d')
+		k = rearrange(k, 'b n h d -> b h n d')
+		v = rearrange(v, 'b n h d -> b h n d')
 
-    # group query attention support
+	q, k = apply_pope_to_qk(pos_emb, q, k, to_magnitude=F.softplus)
 
-    groups = q.shape[1] // k.shape[1]
-    k = repeat(k, 'b h ... -> b (g h) ...', g = groups)
-    v = repeat(v, 'b h ... -> b (g h) ...', g = groups)
+	# group query attention support
 
-    # manual attention path using SDPA
-    # ensure dtypes match for SDPA (apply_pope_to_qk might have upcasted to float32)
+	groups: int = q.shape[1] // k.shape[1]
+	k = repeat(k, 'b h ... -> b (g h) ...', g=groups)
+	v = repeat(v, 'b h ... -> b (g h) ...', g=groups)
 
-    v_dtype = v.dtype
-    v_dim = v.shape[-1]
+	# manual attention path using SDPA
+	# ensure dtypes match for SDPA (apply_pope_to_qk might have upcasted to float32)
 
-    if q.dtype != v.dtype:
-        v = v.to(q.dtype)
+	v_dtype: torch.dtype = v.dtype
+	v_dim: int = v.shape[-1]
 
-    attn_mask = None
-    if exists(mask):
-        attn_mask = rearrange(mask, 'b j -> b 1 1 j')
+	if q.dtype != v.dtype:
+		v = v.to(q.dtype)
 
-    if causal and q_len < kv_len:
-        causal_mask = torch.ones((q_len, kv_len), dtype = torch.bool, device = device).tril(diagonal = kv_len - q_len)
-        attn_mask = and_masks(attn_mask, causal_mask)
-        causal = False
+	attn_mask: Tensor | None = None
+	if exists(mask):
+		attn_mask = rearrange(mask, 'b j -> b 1 1 j')
 
-    out = F.scaled_dot_product_attention(
-        q, k, v,
-        attn_mask = attn_mask,
-        is_causal = causal,
-        scale = softmax_scale,
-        dropout_p = dropout
-    )
+	if causal and (q_len < kv_len or exists(attn_mask)):
+		causal_mask: Tensor = torch.ones((q_len, kv_len), dtype=torch.bool, device=device).tril(diagonal=kv_len - q_len)
+		attn_mask = and_masks([attn_mask, causal_mask])
+		causal = False
 
-    # mps sdpa bug (pytorch 2.9.1) - output takes q/k dim instead of v dim
-    # first v_dim elements are correct, so slicing suffices
-    # only triggers in no_grad (inference). todo - remove once fixed upstream
+	out = F.scaled_dot_product_attention(q, k, v, attn_mask=attn_mask, is_causal=causal, scale=softmax_scale, dropout_p=dropout)
 
-    if out.shape[-1] != v_dim:
-        out = out[..., :v_dim]
+	# mps sdpa bug (pytorch 2.9.1) - output takes q/k dim instead of v dim
+	# first v_dim elements are correct, so slicing suffices
+	# only triggers in no_grad (inference). todo - remove once fixed upstream
 
-    out = out.to(v_dtype)
+	if out.shape[-1] != v_dim:
+		out = out[..., :v_dim]
 
-    if not head_dimension_at_first:
-        out = rearrange(out, 'b h n d -> b n h d')
+	out = out.to(v_dtype)
 
-    return out
+	if not head_dimension_at_first:
+		out = rearrange(out, 'b h n d -> b n h d')
+
+	return out

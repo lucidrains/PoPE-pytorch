@@ -24,8 +24,9 @@ classifiers=[
 
 dependencies = [
     "einops>=0.8.1",
+    "hunterMakesPy",
     "torch>=2.5",
-    "torch-einops-utils>=0.0.14"
+    "torch_einops_kit",
 ]
 
 [project.urls]
