@@ -88,3 +88,31 @@ def test_readme_fused_flash_attn():
     out = flash_attn_with_pope(q, k, v, pos_emb = pos_emb, causal = True, mask = mask)
 
     assert out.shape == (2, 8, 1024, 64)
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason = 'CUDA must be available')
+def test_readme_axial_pope_with_latents():
+    # 16x16 image patches + 4 latents
+    num_patches = 256
+    num_latents = 4
+    seq_len = num_patches + num_latents
+
+    pope = AxialPoPE(dim = 64, heads = 8, axial_dims = (32, 32)).cuda()
+
+    # generate positions for the 16x16 grid
+    pos_emb = pope((16, 16))
+
+    # apply positions to first 256 tokens, leave 4 latents unrotated
+    pos_indices = torch.arange(num_patches, device = 'cuda')
+
+    q = torch.randn(1, 8, seq_len, 64).cuda()
+    k = torch.randn(1, 8, seq_len, 64).cuda()
+    v = torch.randn(1, 8, seq_len, 64).cuda()
+
+    # pass indices to handle unrotated latents
+    out = flash_attn_with_pope(
+        q, k, v,
+        pos_emb = pos_emb,
+        pope_pos_emb_indices = pos_indices
+    )
+
+    assert out.shape == (1, 8, seq_len, 64)

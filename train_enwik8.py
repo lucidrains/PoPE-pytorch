@@ -11,6 +11,8 @@
 # ]
 # ///
 
+import fire
+
 import random
 import tqdm
 import gzip
@@ -20,17 +22,21 @@ from torch import nn
 from torch.nn import functional as F
 from torch.utils.data import DataLoader, Dataset
 
-from einops import rearrange
+from einops import rearrange, repeat
 from x_transformers.autoregressive_wrapper import top_k
 
 from accelerate import Accelerator
+
 from PoPE_pytorch import PoPE
 from PoPE_pytorch.attention import flash_attn_with_pope
 
-# helpers
-
 def exists(v):
     return v is not None
+
+# helpers
+
+def divisible_by(num, den):
+    return (num % den) == 0
 
 def default(v, d):
     return v if exists(v) else d
@@ -47,15 +53,6 @@ def decode_tokens(tokens):
     return ''.join(list(map(decode_token, tokens)))
 
 # modules
-
-class RMSNorm(nn.Module):
-    def __init__(self, dim):
-        super().__init__()
-        self.scale = dim ** 0.5
-        self.gamma = nn.Parameter(torch.ones(dim))
-
-    def forward(self, x):
-        return F.normalize(x, dim = -1) * self.scale * self.gamma
 
 class FeedForward(nn.Module):
     def __init__(self, dim, mult = 4):
@@ -80,20 +77,15 @@ class CausalAttention(nn.Module):
         self.to_qkv = nn.Linear(dim, dim * 3, bias = False)
         self.to_out = nn.Linear(dim, dim, bias = False)
 
-    def forward(self, x, pos_emb = None, cache = None):
+    def forward(self, x, pos_emb = None, pope_pos_emb_indices = None):
         qkv = self.to_qkv(x).chunk(3, dim = -1)
-        q, k, v = map(lambda t: rearrange(t, 'b n (h d) -> b h n d', h = self.heads), qkv)
-
-        if exists(cache):
-            ck, cv = cache
-            k, v = (torch.cat(t, dim = -2) for t in ((ck, k), (cv, v)))
-
-        new_cache = (k, v)
+        q, k, v = (rearrange(t, 'b n (h d) -> b h n d', h = self.heads) for t in qkv)
 
         if self.use_pope and exists(pos_emb):
             out = flash_attn_with_pope(
                 q, k, v,
                 pos_emb = pos_emb,
+                pope_pos_emb_indices = pope_pos_emb_indices,
                 causal = True,
                 softmax_scale = self.scale,
                 fused = True,
@@ -103,7 +95,7 @@ class CausalAttention(nn.Module):
             out = F.scaled_dot_product_attention(q, k, v, is_causal = True, scale = self.scale)
 
         out = rearrange(out, 'b h n d -> b n (h d)')
-        return self.to_out(out), new_cache
+        return self.to_out(out)
 
 # simple transformer
 
@@ -124,71 +116,92 @@ class SimpleTransformer(nn.Module):
         self.token_emb = nn.Embedding(num_tokens, dim)
         self.pos_emb = nn.Embedding(2048, dim) if not use_pope else None
         self.pope = PoPE(dim // heads, heads = heads) if use_pope else None
+        
+        self.num_memory_tokens = 2
+        self.memory_tokens = nn.Parameter(torch.randn(self.num_memory_tokens, dim))
 
         self.layers = nn.ModuleList([nn.ModuleList([
-            RMSNorm(dim),
+            nn.RMSNorm(dim),
             CausalAttention(dim, heads = heads, use_pope = use_pope),
-            RMSNorm(dim),
+            nn.RMSNorm(dim),
             FeedForward(dim = dim),
         ]) for _ in range(depth)])
 
-        self.norm = RMSNorm(dim)
+        self.norm = nn.RMSNorm(dim)
         self.to_logits = nn.Linear(dim, num_tokens, bias = False)
 
-    def forward(self, x, cache = None, return_cache = False):
-        seq_len = x.shape[1]
+    def forward(self, x, return_loss = False):
+        if return_loss:
+            x, labels = x[:, :-1], x[:, 1:]
+
+        b, seq_len, device = *x.shape, x.device
+        num_mem = self.num_memory_tokens
+
         x = self.token_emb(x)
 
-        seq_len_kv = seq_len if not exists(cache) else (cache[0][0].shape[-2] + seq_len)
+        mem = repeat(self.memory_tokens, 'n d -> b n d', b = b)
+        x = torch.cat((mem, x), dim = 1)
 
-        if self.use_pope:
-            pos_emb = self.pope(seq_len_kv)
-        else:
+        pos_indices = torch.arange(num_mem, seq_len + num_mem, device = device)
+        
+        if not self.use_pope:
             pos_emb = None
-            x = x + self.pos_emb(torch.arange(seq_len_kv - seq_len, seq_len_kv, device = x.device))
+            x[:, num_mem:] = x[:, num_mem:] + self.pos_emb(torch.arange(seq_len, device = device))
+        else:
+            pos_emb = self.pope(seq_len)
 
-        new_caches = []
-        for i, (norm1, attn, norm2, ff) in enumerate(self.layers):
-            layer_cache = cache[i] if exists(cache) else None
-            attn_out, new_layer_cache = attn(norm1(x), pos_emb, cache = layer_cache)
-            new_caches.append(new_layer_cache)
-            x = x + attn_out
+        for norm1, attn, norm2, ff in self.layers:
+            x = x + attn(
+                norm1(x),
+                pos_emb = pos_emb,
+                pope_pos_emb_indices = pos_indices
+            )
+
             x = x + ff(norm2(x))
 
+        # exclude memory tokens from logits
+        x = x[:, num_mem:]
         logits = self.to_logits(self.norm(x))
 
-        if return_cache:
-            return logits, new_caches
+        if not return_loss:
+            return logits
 
-        return logits
+        return F.cross_entropy(rearrange(logits, 'b n c -> (b n) c'), labels.reshape(-1))
 
     @torch.no_grad()
-    def generate(self, prompts, seq_len, temperature = 1.0, filter_thres = 0.9):
+    def generate(self, prompts, seq_len, temperature = 1.0, filter_frac = 0.9):
         b, t = prompts.shape
         out = prompts
-        cache = None
 
         for _ in tqdm.tqdm(range(seq_len), desc='generating'):
-            curr_x = out[:, -self.max_seq_len:] if not exists(cache) else out[:, -1:]
-            logits, cache = self.forward(curr_x, cache = cache, return_cache = True)
+            curr_x = out[:, -self.max_seq_len:]
+            logits = self.forward(curr_x)
             logits = logits[:, -1]
 
             # top-k filtering
-            logits = top_k(logits, thres = filter_thres)
+            logits = top_k(logits, frac_num_tokens = filter_frac)
 
             probs = F.softmax(logits / temperature, dim=-1)
             sample = torch.multinomial(probs, 1)
             out = torch.cat((out, sample), dim=-1)
+
         return out[:, t:]
 
-# autoregressive training logic
-def autoregressive_loss(model, x):
-    # x shape: (b, n)
-    inputs = x[:, :-1]
-    targets = x[:, 1:]
-    logits = model(inputs)
-    loss = F.cross_entropy(logits.reshape(-1, logits.size(-1)), targets.reshape(-1))
-    return loss
+# dataset
+
+class TextSamplerDataset(Dataset):
+    def __init__(self, data, seq_len):
+        super().__init__()
+        self.data = data
+        self.seq_len = seq_len
+
+    def __getitem__(self, index):
+        rand_start = torch.randint(0, self.data.size(0) - self.seq_len - 1, (1,))
+        full_seq = self.data[rand_start: rand_start + self.seq_len + 1].long()
+        return full_seq.squeeze(0)
+
+    def __len__(self):
+        return self.data.size(0) // self.seq_len
 
 # training
 
@@ -222,6 +235,8 @@ def train(
         use_pope = use_pope,
     )
 
+    print(f'\nTraining with {model.num_memory_tokens} unrotated memory tokens and sequence length of {seq_len}.\n')
+
     # data
 
     with gzip.open('./data/enwik8.gz') as file:
@@ -229,19 +244,7 @@ def train(
         train_x, valid_x = np.split(data, [int(90e6)])
         data_train, data_val = torch.from_numpy(train_x), torch.from_numpy(valid_x)
 
-    class TextSamplerDataset(Dataset):
-        def __init__(self, data, seq_len):
-            super().__init__()
-            self.data = data
-            self.seq_len = seq_len
 
-        def __getitem__(self, index):
-            rand_start = torch.randint(0, self.data.size(0) - self.seq_len - 1, (1,))
-            full_seq = self.data[rand_start: rand_start + self.seq_len + 1].long()
-            return full_seq.squeeze(0)
-
-        def __len__(self):
-            return self.data.size(0) // self.seq_len
 
     train_dataset = TextSamplerDataset(data_train, seq_len)
     val_dataset   = TextSamplerDataset(data_val, seq_len)
@@ -274,7 +277,7 @@ def train(
         model.train()
 
         for _ in range(gradient_accumulate_every):
-            loss = autoregressive_loss(model, next(train_loader))
+            loss = model(next(train_loader), return_loss = True)
             accelerator.backward(loss / gradient_accumulate_every)
 
         train_loss = loss.item()
@@ -287,15 +290,16 @@ def train(
         optimizer.step()
         optimizer.zero_grad()
 
-        if i % validate_every == 0:
+        if divisible_by(i, validate_every):
             model.eval()
             with torch.no_grad():
-                val_loss = autoregressive_loss(model, next(val_loader)).item()
+                val_loss = model(next(val_loader), return_loss = True).item()
                 pbar.set_postfix(loss = f'{train_loss:.4f}', val = f'{val_loss:.4f}')
+
                 if use_wandb:
                     wandb.log(dict(valid_loss = val_loss), step = i)
 
-        if i % generate_every == 0 and accelerator.is_main_process:
+        if divisible_by(i, generate_every) and accelerator.is_main_process:
             model.eval()
             inp = random.choice(val_dataset)[:-1].unsqueeze(0).to(device)
             prime = decode_tokens(inp[0].cpu().numpy())
@@ -313,5 +317,4 @@ def train(
             print(f'{"=" * 80}\n')
 
 if __name__ == '__main__':
-    import fire
     fire.Fire(train)

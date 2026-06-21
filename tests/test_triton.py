@@ -64,14 +64,14 @@ def test_triton_non_contiguous():
     q = torch.randn(batch, heads, seq, dim, device = device, requires_grad = True)
     k = torch.randn(batch, heads, seq, dim, device = device, requires_grad = True)
 
-    # Non-contiguous slices
+    # non-contiguous slices
     q_nc = q[:, :, :128, :].detach().requires_grad_(True)
     k_nc = k[:, :, :128, :].detach().requires_grad_(True)
 
     pope = PoPE(rotate_dim, heads = heads).to(device)
     freqs, bias = pope(256)
 
-    # Isolation: detach and re-require grad for reference and triton pass
+    # isolation: detach and require grad for ref and triton
     f_ref, b_ref = freqs[:128].detach().requires_grad_(True), bias.detach().requires_grad_(True)
     f_tri, b_tri = freqs[:128].detach().requires_grad_(True), bias.detach().requires_grad_(True)
 

@@ -121,7 +121,7 @@ def _apply_rotations(act, freq, mask_r):
 })
 @triton.jit
 def _fwd_kernel(
-    Q, K, V, Freqs, PopeBias, Out, Lse, Mask,
+    Q, K, V, Freqs, PopeBias, Out, Lse, Mask, PosMask,
     softmax_scale,
     stride_qb, stride_qh, stride_qm,
     stride_kb, stride_kh, stride_kn,
@@ -131,7 +131,7 @@ def _fwd_kernel(
     stride_ob, stride_oh, stride_om,
     stride_kmb, stride_kmn,
     n_heads, seqlen_q, seqlen_k, headdim, rotate_dim, dropout_p, drop_seed,
-    HAS_POPE: tl.constexpr, IS_CAUSAL: tl.constexpr, HAS_MASK: tl.constexpr, IS_DROPOUT: tl.constexpr,
+    HAS_POPE: tl.constexpr, IS_CAUSAL: tl.constexpr, HAS_MASK: tl.constexpr, IS_DROPOUT: tl.constexpr, HAS_POS_MASK: tl.constexpr,
     BLOCK_HEADDIM: tl.constexpr, EVEN_M: tl.constexpr, EVEN_N: tl.constexpr, EVEN_HEADDIM: tl.constexpr,
     BM: tl.constexpr, BN: tl.constexpr,
 ):
@@ -161,12 +161,16 @@ def _fwd_kernel(
 
     q_off = seqlen_k - seqlen_q
 
+
     if HAS_POPE:
-        q = _apply_softplus(q, mask_r)
+        q_act = _apply_softplus(q, mask_r)
         fq = tl.load(Freqs + b * stride_fb + h * stride_fh + (q_off + off_m[:, None]) * stride_fi + off_d[None, :], mask = mask_m[:, None] & mask_r[None, :], other = 0.0).to(tl.float32)
-        q_cos, q_sin = _apply_rotations(q, fq, mask_r)
+        q_cos, q_sin = _apply_rotations(q_act, fq, mask_r)
     else:
         q_cos, q_sin = q, None
+
+    if HAS_POS_MASK:
+        pos_m = tl.load(PosMask + off_m, mask=mask_m, other=0).to(tl.int1)
 
     # online softmax accumulators
 
@@ -191,17 +195,26 @@ def _fwd_kernel(
 
         # compute qk
 
+
         if HAS_POPE:
-            k = _apply_softplus(k, mask_r)
+            k_act = _apply_softplus(k, mask_r)
             fk = tl.load(Freqs + b * stride_fb + h * stride_fh + col_n[:, None] * stride_fi + off_d[None, :], mask = cmask[:, None] & mask_r[None, :], other = 0.0)
             bias = tl.load(PopeBias + h * stride_pbh + off_d, mask = mask_r, other = 0.0)
             th_k = (fk + bias[None, :]).to(tl.float32)
-            k_cos, k_sin = _apply_rotations(k, th_k, mask_r)
-            qk = tl.dot(q_cos, tl.trans(k_cos)) + tl.dot(q_sin, tl.trans(k_sin))
+            k_cos, k_sin = _apply_rotations(k_act, th_k, mask_r)
+            qk_rot = tl.dot(q_cos, tl.trans(k_cos)) + tl.dot(q_sin, tl.trans(k_sin))
         else:
-            qk = tl.dot(q_cos, tl.trans(k))
+            qk_rot = tl.dot(q_cos, tl.trans(k))
 
-        qk *= softmax_scale
+        qk_rot *= softmax_scale
+        
+        if HAS_POS_MASK:
+            qk_unrot = tl.dot(q, tl.trans(k)) * softmax_scale
+            pos_k = tl.load(PosMask + col_n, mask=cmask, other=0).to(tl.int1)
+            is_both = pos_m[:, None] & pos_k[None, :]
+            qk = tl.where(is_both, qk_rot, qk_unrot)
+        else:
+            qk = qk_rot
 
         # masking
 
@@ -286,7 +299,7 @@ def _bwd_preprocess(
 })
 @triton.jit
 def _bwd_kernel(
-    Q, K, V, Freqs, PopeBias, DO, DQ, DK, DV, DFreqs, DPopeBias, Lse, Delta, Mask,
+    Q, K, V, Freqs, PopeBias, DO, DQ, DK, DV, DFreqs, DPopeBias, Lse, Delta, Mask, PosMask,
     softmax_scale,
     stride_qb, stride_qh, stride_qm,
     stride_kb, stride_kh, stride_kn,
@@ -300,7 +313,7 @@ def _bwd_kernel(
     stride_dfb, stride_dfh, stride_dfi,
     stride_kmb, stride_kmn,
     n_heads, seqlen_q, seqlen_k, headdim, rotate_dim, dropout_p, drop_seed,
-    HAS_POPE: tl.constexpr, IS_CAUSAL: tl.constexpr, HAS_MASK: tl.constexpr, IS_DROPOUT: tl.constexpr,
+    HAS_POPE: tl.constexpr, IS_CAUSAL: tl.constexpr, HAS_MASK: tl.constexpr, IS_DROPOUT: tl.constexpr, HAS_POS_MASK: tl.constexpr,
     BLOCK_HEADDIM: tl.constexpr, EVEN_M: tl.constexpr, EVEN_N: tl.constexpr, EVEN_HEADDIM: tl.constexpr,
     BM: tl.constexpr, BN: tl.constexpr,
 ):
@@ -324,14 +337,18 @@ def _bwd_kernel(
 
     # apply pope rotary to k
 
+
     if HAS_POPE:
-        act_k = _apply_softplus(k, mask_r)
+        k_act = _apply_softplus(k, mask_r)
         fk = tl.load(Freqs + b * stride_fb + h * stride_fh + off_n[:, None] * stride_fi + off_d[None, :], mask = mask_n[:, None] & mask_r[None, :], other = 0.0)
         bias = tl.load(PopeBias + h * stride_pbh + off_d, mask = mask_r, other = 0.0)
         th_k = (fk + bias[None, :]).to(tl.float32)
-        k_cos, k_sin = _apply_rotations(act_k, th_k, mask_r)
+        k_cos, k_sin = _apply_rotations(k_act, th_k, mask_r)
     else:
         k_cos, k_sin = k, None
+        
+    if HAS_POS_MASK:
+        pos_n = tl.load(PosMask + off_n, mask=mask_n, other=0).to(tl.int1)
 
     # gradient accumulators
 
@@ -350,15 +367,24 @@ def _bwd_kernel(
 
         # recompute attention
 
-        if HAS_POPE:
-            act_q = _apply_softplus(q, mask_r)
-            fq = tl.load(Freqs + b * stride_fb + h * stride_fh + (q_off + cur_m[:, None]) * stride_fi + off_d[None, :], mask = mask_m[:, None] & mask_r[None, :], other = 0.0).to(tl.float32)
-            q_cos, q_sin = _apply_rotations(act_q, fq, mask_r)
-            qk = tl.dot(q_cos, tl.trans(k_cos)) + tl.dot(q_sin, tl.trans(k_sin))
-        else:
-            qk = tl.dot(q, tl.trans(k))
 
-        qk *= softmax_scale
+        if HAS_POPE:
+            q_act = _apply_softplus(q, mask_r)
+            fq = tl.load(Freqs + b * stride_fb + h * stride_fh + (q_off + cur_m[:, None]) * stride_fi + off_d[None, :], mask = mask_m[:, None] & mask_r[None, :], other = 0.0).to(tl.float32)
+            q_cos, q_sin = _apply_rotations(q_act, fq, mask_r)
+            qk_rot = tl.dot(q_cos, tl.trans(k_cos)) + tl.dot(q_sin, tl.trans(k_sin))
+        else:
+            qk_rot = tl.dot(q, tl.trans(k))
+
+        qk_rot *= softmax_scale
+        
+        if HAS_POS_MASK:
+            qk_unrot = tl.dot(q, tl.trans(k)) * softmax_scale
+            pos_m = tl.load(PosMask + cur_m, mask=mask_m, other=0).to(tl.int1)
+            is_both = pos_m[:, None] & pos_n[None, :]
+            qk = tl.where(is_both, qk_rot, qk_unrot)
+        else:
+            qk = qk_rot
 
         if IS_CAUSAL:
             qk += tl.where(cur_m[:, None] + q_off >= off_n[None, :], 0, float('-inf'))
@@ -395,6 +421,7 @@ def _bwd_kernel(
 
         # dq, dk gradients
 
+
         if HAS_POPE:
             dqkc = tl.dot(ds.to(q_cos.dtype), k_cos)
             dqks = tl.dot(ds.to(k_sin.dtype), k_sin)
@@ -402,19 +429,65 @@ def _bwd_kernel(
 
             dkkc = tl.dot(tl.trans(ds.to(q_cos.dtype)), q_cos)
             dkks = tl.dot(tl.trans(ds.to(q_sin.dtype)), q_sin)
-            d_k += tl.where(mask_r[None, :], (dkkc * tl.cos(th_k).to(dkkc.dtype) + dkks * tl.sin(th_k).to(dkks.dtype)) * _softplus_grad(k.to(tl.float32)).to(k.dtype), dkkc)
+            dk_rot = tl.where(mask_r[None, :], (dkkc * tl.cos(th_k).to(dkkc.dtype) + dkks * tl.sin(th_k).to(dkks.dtype)) * _softplus_grad(k.to(tl.float32)).to(k.dtype), dkkc)
+            
+            if HAS_POS_MASK:
+                is_both_f32 = tl.where(is_both, 1.0, 0.0)
+                ds_rot = ds * is_both_f32
+                ds_unrot = ds * (1.0 - is_both_f32)
+                
+                # Recompute for rot with masked ds
+                dqkc = tl.dot(ds_rot.to(q_cos.dtype), k_cos)
+                dqks = tl.dot(ds_rot.to(k_sin.dtype), k_sin)
+                dq_rot = tl.where(mask_r[None, :], (dqkc * tl.cos(fq).to(dqkc.dtype) + dqks * tl.sin(fq).to(dqks.dtype)) * _softplus_grad(q.to(tl.float32)).to(q.dtype), dqkc)
+                
+                dkkc = tl.dot(tl.trans(ds_rot.to(q_cos.dtype)), q_cos)
+                dkks = tl.dot(tl.trans(ds_rot.to(q_sin.dtype)), q_sin)
+                dk_rot = tl.where(mask_r[None, :], (dkkc * tl.cos(th_k).to(dkkc.dtype) + dkks * tl.sin(th_k).to(dkks.dtype)) * _softplus_grad(k.to(tl.float32)).to(k.dtype), dkkc)
+                
+                dq_unrot = tl.dot(ds_unrot.to(k.dtype), k)
+                dk_unrot = tl.dot(tl.trans(ds_unrot.to(q.dtype)), q)
+                
+                dq = dq_rot + dq_unrot
+                d_k += dk_rot + dk_unrot
+            else:
+                d_k += dk_rot
 
             # dfreqs, dpope_bias via atomic_add
+            if HAS_POS_MASK:
+                ds_use = ds_rot
+            else:
+                ds_use = ds
+                
+            # actually we need to recompute dqks/dqkc for dfq using ds_use?
+            # Wait! In original code:
+            dfq_dqks = tl.dot(ds_use.to(k_sin.dtype), k_sin)
+            dfq_dqkc = tl.dot(ds_use.to(q_cos.dtype), k_cos)
+            dfk_dkks = tl.dot(tl.trans(ds_use.to(q_sin.dtype)), q_sin)
+            dfk_dkkc = tl.dot(tl.trans(ds_use.to(q_cos.dtype)), q_cos)
 
-            dfq = (dqks.to(tl.float32) * q_cos.to(tl.float32) - dqkc.to(tl.float32) * q_sin.to(tl.float32)).to(DFreqs.dtype.element_ty)
+            dfq = (dfq_dqks.to(tl.float32) * q_cos.to(tl.float32) - dfq_dqkc.to(tl.float32) * q_sin.to(tl.float32)).to(DFreqs.dtype.element_ty)
             tl.atomic_add(DFreqs + b * stride_dfb + h * stride_dfh + (q_off + cur_m[:, None]) * stride_dfi + off_d[None, :], dfq, mask = mask_m[:, None] & mask_r[None, :])
 
-            dfk = (dkks.to(tl.float32) * k_cos.to(tl.float32) - dkkc.to(tl.float32) * k_sin.to(tl.float32)).to(DFreqs.dtype.element_ty)
+            dfk = (dfk_dkks.to(tl.float32) * k_cos.to(tl.float32) - dfk_dkkc.to(tl.float32) * k_sin.to(tl.float32)).to(DFreqs.dtype.element_ty)
             tl.atomic_add(DFreqs + b * stride_dfb + h * stride_dfh + off_n[:, None] * stride_dfi + off_d[None, :], dfk, mask = mask_n[:, None] & mask_r[None, :])
             tl.atomic_add(DPopeBias + h * stride_pbh + off_d, tl.sum(dfk, 0), mask = mask_r)
         else:
-            dq = tl.dot(ds.to(k.dtype), k)
-            d_k += tl.dot(tl.trans(ds.to(q.dtype)), q)
+            if HAS_POS_MASK:
+                is_both_f32 = tl.where(is_both, 1.0, 0.0)
+                ds_rot = ds * is_both_f32
+                ds_unrot = ds * (1.0 - is_both_f32)
+                
+                dq_rot = tl.dot(ds_rot.to(k.dtype), k)
+                d_k += tl.dot(tl.trans(ds_rot.to(q.dtype)), q)
+                
+                dq_unrot = tl.dot(ds_unrot.to(k.dtype), k)
+                d_k += tl.dot(tl.trans(ds_unrot.to(q.dtype)), q)
+                
+                dq = dq_rot + dq_unrot
+            else:
+                dq = tl.dot(ds.to(k.dtype), k)
+                d_k += tl.dot(tl.trans(ds.to(q.dtype)), q)
 
         # dq via atomic_add (accumulated across k-blocks)
 
@@ -427,7 +500,7 @@ def _bwd_kernel(
 
 # wrapper functions
 
-def flash_attn_forward(q, k, v, freqs = None, pope_bias = None, mask = None, causal = False, softmax_scale = None, dropout = 0., drop_seed = 0):
+def flash_attn_forward(q, k, v, freqs = None, pope_bias = None, mask = None, causal = False, softmax_scale = None, dropout = 0., drop_seed = 0, pos_mask = None):
     batch, seq_q, heads, d = q.shape
     seq_k = k.shape[1]
 
@@ -448,7 +521,7 @@ def flash_attn_forward(q, k, v, freqs = None, pope_bias = None, mask = None, cau
         bm, bn = configs[0].kwargs['BM'], configs[0].kwargs['BN']
         grid = (triton.cdiv(seq_q, bm), batch * heads)
         _fwd_kernel[grid](
-            q, k, v, freqs, pope_bias, o, lse, mask, scale,
+            q, k, v, freqs, pope_bias, o, lse, mask, pos_mask, scale,
             q.stride(0), q.stride(2), q.stride(1),
             k.stride(0), k.stride(2), k.stride(1),
             v.stride(0), v.stride(2), v.stride(1),
@@ -456,7 +529,7 @@ def flash_attn_forward(q, k, v, freqs = None, pope_bias = None, mask = None, cau
             o.stride(0), o.stride(2), o.stride(1),
             *m_str,
             heads, seq_q, seq_k, d, rot, dropout, drop_seed,
-            has_p, causal, exists(mask), dropout > 0.0,
+            has_p, causal, exists(mask), dropout > 0.0, exists(pos_mask),
             BLOCK_HEADDIM = blk_d, BM = bm, BN = bn,
             num_warps = 4, num_stages = 1,
         )
@@ -464,7 +537,7 @@ def flash_attn_forward(q, k, v, freqs = None, pope_bias = None, mask = None, cau
         kernel = get_autotuned_kernel(_fwd_kernel, _fwd_configs, ('seqlen_q', 'seqlen_k', 'headdim'), blk_d, q.element_size(), q.device.index)
         grid = lambda META: (triton.cdiv(seq_q, META['BM']), batch * heads)
         kernel[grid](
-            q, k, v, freqs, pope_bias, o, lse, mask, scale,
+            q, k, v, freqs, pope_bias, o, lse, mask, pos_mask, scale,
             q.stride(0), q.stride(2), q.stride(1),
             k.stride(0), k.stride(2), k.stride(1),
             v.stride(0), v.stride(2), v.stride(1),
@@ -472,13 +545,13 @@ def flash_attn_forward(q, k, v, freqs = None, pope_bias = None, mask = None, cau
             o.stride(0), o.stride(2), o.stride(1),
             *m_str,
             heads, seq_q, seq_k, d, rot, dropout, drop_seed,
-            has_p, causal, exists(mask), dropout > 0.0,
+            has_p, causal, exists(mask), dropout > 0.0, exists(pos_mask),
             BLOCK_HEADDIM = blk_d,
         )
 
     return o, lse
 
-def flash_attn_backward(do, q, k, v, o, lse, dq, dk, dv, dfreqs = None, dpope_bias = None, freqs = None, pope_bias = None, mask = None, causal = False, softmax_scale = None, dropout = 0., drop_seed = 0):
+def flash_attn_backward(do, q, k, v, o, lse, dq, dk, dv, dfreqs = None, dpope_bias = None, freqs = None, pope_bias = None, mask = None, causal = False, softmax_scale = None, dropout = 0., drop_seed = 0, pos_mask = None):
     batch, seq_q, heads, d = q.shape
     seq_k = k.shape[1]
 
@@ -514,7 +587,7 @@ def flash_attn_backward(do, q, k, v, o, lse, dq, dk, dv, dfreqs = None, dpope_bi
         nw = 4 if d > 32 else 2
         grid = (triton.cdiv(seq_k, bn), batch * heads)
         _bwd_kernel[grid](
-            q, k, v, freqs, pope_bias, do, dq, dk, dv, dfreqs, dpope_bias, lse, delta, mask, scale,
+            q, k, v, freqs, pope_bias, do, dq, dk, dv, dfreqs, dpope_bias, lse, delta, mask, pos_mask, scale,
             q.stride(0), q.stride(2), q.stride(1),
             k.stride(0), k.stride(2), k.stride(1),
             v.stride(0), v.stride(2), v.stride(1),
@@ -525,7 +598,7 @@ def flash_attn_backward(do, q, k, v, o, lse, dq, dk, dv, dfreqs = None, dpope_bi
             dv.stride(0), dv.stride(2), dv.stride(1),
             *df_str, *m_str,
             heads, seq_q, seq_k, d, rot, dropout, drop_seed,
-            has_p, causal, exists(mask), dropout > 0.0,
+            has_p, causal, exists(mask), dropout > 0.0, exists(pos_mask),
             BLOCK_HEADDIM = blk_d, BM = bm, BN = bn,
             num_warps = nw, num_stages = 1,
         )
@@ -533,7 +606,7 @@ def flash_attn_backward(do, q, k, v, o, lse, dq, dk, dv, dfreqs = None, dpope_bi
         kernel = get_autotuned_kernel(_bwd_kernel, _bwd_configs, ('seqlen_q', 'seqlen_k', 'headdim'), blk_d, elem_bytes, dev)
         grid = lambda META: (triton.cdiv(seq_k, META['BN']), batch * heads)
         kernel[grid](
-            q, k, v, freqs, pope_bias, do, dq, dk, dv, dfreqs, dpope_bias, lse, delta, mask, scale,
+            q, k, v, freqs, pope_bias, do, dq, dk, dv, dfreqs, dpope_bias, lse, delta, mask, pos_mask, scale,
             q.stride(0), q.stride(2), q.stride(1),
             k.stride(0), k.stride(2), k.stride(1),
             v.stride(0), v.stride(2), v.stride(1),
@@ -544,7 +617,7 @@ def flash_attn_backward(do, q, k, v, o, lse, dq, dk, dv, dfreqs = None, dpope_bi
             dv.stride(0), dv.stride(2), dv.stride(1),
             *df_str, *m_str,
             heads, seq_q, seq_k, d, rot, dropout, drop_seed,
-            has_p, causal, exists(mask), dropout > 0.0,
+            has_p, causal, exists(mask), dropout > 0.0, exists(pos_mask),
             BLOCK_HEADDIM = blk_d,
         )
 
@@ -552,10 +625,10 @@ def flash_attn_backward(do, q, k, v, o, lse, dq, dk, dv, dfreqs = None, dpope_bi
 
 class FlashAttnFunction(Function):
     @staticmethod
-    def forward(ctx, q, k, v, freqs = None, pope_bias = None, mask = None, causal = False, softmax_scale = None, dropout = 0.):
+    def forward(ctx, q, k, v, freqs = None, pope_bias = None, mask = None, causal = False, softmax_scale = None, dropout = 0., pos_mask = None):
         drop_seed = int(torch.randint(0, 2**31 - 1, (1,), device=q.device).item()) if dropout > 0. else 0
-        o, lse = flash_attn_forward(q, k, v, freqs, pope_bias, mask, causal, softmax_scale, dropout, drop_seed)
-        ctx.save_for_backward(q, k, v, freqs, pope_bias, mask, o, lse)
+        o, lse = flash_attn_forward(q, k, v, freqs, pope_bias, mask, causal, softmax_scale, dropout, drop_seed, pos_mask)
+        ctx.save_for_backward(q, k, v, freqs, pope_bias, mask, o, lse, pos_mask)
         ctx.causal = causal
         ctx.softmax_scale = softmax_scale
         ctx.dropout = dropout
@@ -565,7 +638,7 @@ class FlashAttnFunction(Function):
     @staticmethod
     def backward(ctx, do):
         do = do.contiguous()
-        q, k, v, f, pb, m, o, lse = ctx.saved_tensors
+        q, k, v, f, pb, m, o, lse, pos_mask = ctx.saved_tensors
 
         dq = torch.zeros_like(q, dtype = torch.float32)
         dk = torch.zeros_like(k)
@@ -573,11 +646,11 @@ class FlashAttnFunction(Function):
         df = torch.zeros_like(f) if exists(f) else None
         dpb = torch.zeros_like(pb) if exists(pb) else None
 
-        flash_attn_backward(do, q, k, v, o, lse, dq, dk, dv, df, dpb, f, pb, m, ctx.causal, ctx.softmax_scale, ctx.dropout, ctx.drop_seed)
-        return dq.to(q.dtype), dk, dv, df, dpb, None, None, None, None
+        flash_attn_backward(do, q, k, v, o, lse, dq, dk, dv, df, dpb, f, pb, m, ctx.causal, ctx.softmax_scale, ctx.dropout, ctx.drop_seed, pos_mask)
+        return dq.to(q.dtype), dk, dv, df, dpb, None, None, None, None, None
 
 # public api
 
-def flash_attn(q, k, v, freqs = None, pope_bias = None, mask = None, causal = False, softmax_scale = None, dropout = 0.):
+def flash_attn(q, k, v, freqs = None, pope_bias = None, mask = None, causal = False, softmax_scale = None, dropout = 0., pos_mask = None):
     q, k, v = map(lambda t: t.contiguous(), (q, k, v))
-    return FlashAttnFunction.apply(q, k, v, freqs, pope_bias, mask, causal, softmax_scale, dropout)
+    return FlashAttnFunction.apply(q, k, v, freqs, pope_bias, mask, causal, softmax_scale, dropout, pos_mask)

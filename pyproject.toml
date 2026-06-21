@@ -23,14 +23,15 @@ classifiers=[
 ]
 
 dependencies = [
+    "einx[torch]>=0.3.0",
     "einops>=0.8.1",
     "torch>=2.5",
-    "torch-einops-utils>=0.0.14"
+    "torch-einops-utils>=0.1.0"
 ]
 
 [project.urls]
 Homepage = "https://pypi.org/project/PoPE-pytorch/"
-Repository = "https://github.com/lucidrains/PoPE-pytorch"
+Repository = "https://codeberg.org/lucidrains/PoPE-pytorch"
 
 [project.optional-dependencies]
 examples = []
