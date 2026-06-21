@@ -132,7 +132,7 @@ assert out.shape == (2, 8, 1024, 64)
 
 ### PoPE with Mixed Rotated and Unrotated Tokens
 
-For architectures like Vision Transformers (ViT) with multiple CLS or register tokens, you may want to append unrotated tokens to your image patches. You can pass explicit position indices to specify which tokens receive which rotations.
+For architectures like Vision Transformers (ViT) with multiple CLS or register tokens, you may want to append unrotated tokens to your image patches. You can pass explicit position indices to specify which tokens undergo PoPE rotations. When unrotated tokens interact with rotated tokens (or other unrotated tokens), they do so without any relative positional bias.
 
 ```python
 import torch

@@ -166,14 +166,17 @@ class SimpleTransformer(nn.Module):
         if not return_loss:
             return logits
 
-        return F.cross_entropy(rearrange(logits, 'b n c -> (b n) c'), labels.reshape(-1))
+        return F.cross_entropy(
+            rearrange(logits, 'b n c -> (b n) c'),
+            rearrange(labels, 'b n -> (b n)')
+        )
 
     @torch.no_grad()
     def generate(self, prompts, seq_len, temperature = 1.0, filter_frac = 0.9):
         b, t = prompts.shape
         out = prompts
 
-        for _ in tqdm.tqdm(range(seq_len), desc='generating'):
+        for _ in tqdm.tqdm(range(seq_len), desc = 'generating'):
             curr_x = out[:, -self.max_seq_len:]
             logits = self.forward(curr_x)
             logits = logits[:, -1]
@@ -181,9 +184,9 @@ class SimpleTransformer(nn.Module):
             # top-k filtering
             logits = top_k(logits, frac_num_tokens = filter_frac)
 
-            probs = F.softmax(logits / temperature, dim=-1)
+            probs = F.softmax(logits / temperature, dim = -1)
             sample = torch.multinomial(probs, 1)
-            out = torch.cat((out, sample), dim=-1)
+            out = torch.cat((out, sample), dim = -1)
 
         return out[:, t:]
 
@@ -198,7 +201,7 @@ class TextSamplerDataset(Dataset):
     def __getitem__(self, index):
         rand_start = torch.randint(0, self.data.size(0) - self.seq_len - 1, (1,))
         full_seq = self.data[rand_start: rand_start + self.seq_len + 1].long()
-        return full_seq.squeeze(0)
+        return full_seq
 
     def __len__(self):
         return self.data.size(0) // self.seq_len
@@ -243,8 +246,6 @@ def train(
         data = np.frombuffer(file.read(int(95e6)), dtype = np.uint8).copy()
         train_x, valid_x = np.split(data, [int(90e6)])
         data_train, data_val = torch.from_numpy(train_x), torch.from_numpy(valid_x)
-
-
 
     train_dataset = TextSamplerDataset(data_train, seq_len)
     val_dataset   = TextSamplerDataset(data_val, seq_len)
@@ -301,7 +302,8 @@ def train(
 
         if divisible_by(i, generate_every) and accelerator.is_main_process:
             model.eval()
-            inp = random.choice(val_dataset)[:-1].unsqueeze(0).to(device)
+            inp = random.choice(val_dataset)[:-1]
+            inp = rearrange(inp, 'n -> 1 n').to(device)
             prime = decode_tokens(inp[0].cpu().numpy())
 
             sample = accelerator.unwrap_model(model).generate(
@@ -310,11 +312,11 @@ def train(
             )
 
             output_str = decode_tokens(sample[0].cpu().numpy())
-            print(f'\n{"=" * 80}')
+            print(f'\n{"-" * 80}')
             print(f'[prime] {prime[:80]}...')
-            print(f'{"=" * 80}')
+            print(f'{"-" * 80}')
             print(f'[generated] {output_str[:200]}')
-            print(f'{"=" * 80}\n')
+            print(f'{"-" * 80}\n')
 
 if __name__ == '__main__':
     fire.Fire(train)

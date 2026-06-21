@@ -1,15 +1,21 @@
 import torch
-from torch import is_tensor
-import torch
 import torch.nn.functional as F
-from torch import is_tensor
-
+from torch import is_tensor, einsum
 from PoPE_pytorch.pope import apply_pope_to_qk
 
 from torch_einops_utils import and_masks
 
 import einx
 from einops import rearrange, repeat
+
+# triton available
+
+try:
+    from .triton_pope import triton_compute_qk_similarity
+    from .triton_pope_flash_attn import flash_attn
+    TRITON_AVAILABLE = True
+except ImportError:
+    TRITON_AVAILABLE = False
 
 # helpers
 
@@ -23,21 +29,12 @@ def divisible_by(num, den):
     return (num % den) == 0
 
 def pad_freqs_for_mixed_positions(freqs, indices, seq_len, device):
-    if not is_tensor(freqs):
+    if not exists(freqs):
         return freqs
 
-    padded_freqs = torch.zeros((seq_len, freqs.shape[-1]), device = device, dtype = freqs.dtype)
+    padded_freqs = freqs.new_zeros((seq_len, freqs.shape[-1]))
     padded_freqs[indices] = freqs
     return padded_freqs
-
-# triton available
-
-try:
-    from .triton_pope import triton_compute_qk_similarity
-    from .triton_pope_flash_attn import flash_attn
-    TRITON_AVAILABLE = True
-except ImportError:
-    TRITON_AVAILABLE = False
 
 # functions
 
@@ -65,13 +62,14 @@ def compute_attn_similarity_non_fused(
     pope = (freqs, bias)
     q_pope, k_pope = apply_pope_to_qk(pope, q, k, to_magnitude = F.softplus)
 
-    sim_rot = torch.einsum('b h i d, b h j d -> b h i j', q_pope, k_pope)
+    sim_rot = einsum('b h i d, b h j d -> b h i j', q_pope, k_pope)
 
     if exists(pope_pos_emb_indices):
-        sim_unrot = torch.einsum('b h i d, b h j d -> b h i j', q, k)
-        pos_mask = torch.zeros(q_len, device=device, dtype=torch.bool)
+        # handle mixed positions
+        sim_unrot = einsum('b h i d, b h j d -> b h i j', q, k)
+        pos_mask = q.new_zeros(q_len, dtype = torch.bool)
         pos_mask[pope_pos_emb_indices] = True
-        is_pos_2d = pos_mask[:, None] & pos_mask[None, :]
+        is_pos_2d = einx.logical_and('i, j -> i j', pos_mask, pos_mask)
         return torch.where(is_pos_2d, sim_rot, sim_unrot)
 
     return sim_rot
@@ -84,8 +82,8 @@ def compute_attn_similarity(
     allow_tf32 = True,
     head_dimension_at_first = True
 ):
-    seq_dim = 1 if head_dimension_at_first else 2
-    q_heads, k_heads = q.shape[seq_dim], k.shape[seq_dim]
+    head_idx = 1 if head_dimension_at_first else 2
+    q_heads, k_heads = q.shape[head_idx], k.shape[head_idx]
     assert divisible_by(q_heads, k_heads)
 
     freqs, bias = pope
@@ -98,7 +96,7 @@ def compute_attn_similarity(
     if TRITON_AVAILABLE and is_cuda:
         if not head_dimension_at_first:
             q = rearrange(q, 'b n h d -> b h n d')
-            k = rearrange(k, 'b h n d -> b h n d')
+            k = rearrange(k, 'b n h d -> b h n d')
 
         rotate_dim = freqs.shape[-1]
         
@@ -122,8 +120,9 @@ def flash_attn_with_pope(
     dropout = 0.
 ):
     seq_dim = 2 if head_dimension_at_first else 1
+    head_idx = 1 if head_dimension_at_first else 2
     q_len, kv_len, device = q.shape[seq_dim], k.shape[seq_dim], q.device
-    q_heads, k_heads = q.shape[seq_dim - 1], k.shape[seq_dim - 1]
+    q_heads, k_heads = q.shape[head_idx], k.shape[head_idx]
 
     fused = default(fused, TRITON_AVAILABLE and q.is_cuda)
 
@@ -143,9 +142,9 @@ def flash_attn_with_pope(
         freqs, bias = pos_emb
         
         if exists(pope_pos_emb_indices):
-            # mixed rotary positions: pad freqs with zeros
+            # handle mixed positions
             freqs = pad_freqs_for_mixed_positions(freqs, pope_pos_emb_indices, q_len, device)
-            pos_mask = torch.zeros(q_len, device=device, dtype=torch.bool)
+            pos_mask = q.new_zeros(q_len, dtype = torch.bool)
             pos_mask[pope_pos_emb_indices] = True
 
         pos_emb = (freqs, bias)
@@ -165,6 +164,11 @@ def flash_attn_with_pope(
     # non-fused manual path
     # standardize to (batch, heads, seq, dim)
 
+    is_decode = q_len == 1
+
+    if causal and is_decode:
+        causal = False
+
     if not head_dimension_at_first:
         q = rearrange(q, 'b n h d -> b h n d')
         k = rearrange(k, 'b n h d -> b h n d')
@@ -182,27 +186,24 @@ def flash_attn_with_pope(
         v = v.to(q.dtype)
 
     if exists(pos_mask):
-        sim_unrot = torch.einsum('b h i d, b h j d -> b h i j', q, k) * softmax_scale
-        sim_rot = torch.einsum('b h i d, b h j d -> b h i j', q_pope, k_pope) * softmax_scale
-        is_pos_2d = pos_mask[:, None] & pos_mask[None, :]
+        # handle mixed positions manually
+
+        sim_unrot = einsum('b h i d, b h j d -> b h i j', q, k) * softmax_scale
+        sim_rot = einsum('b h i d, b h j d -> b h i j', q_pope, k_pope) * softmax_scale
+        is_pos_2d = einx.logical_and('i, j -> i j', pos_mask, pos_mask)
         sim = torch.where(is_pos_2d, sim_rot, sim_unrot)
 
         if exists(attn_mask):
-            sim = sim + attn_mask
+            sim = torch.where(attn_mask, sim, float('-inf'))
 
         if causal:
             causal_mask = torch.ones((q_len, kv_len), dtype = torch.bool, device = device).tril(diagonal = kv_len - q_len)
             sim = torch.where(causal_mask, sim, float('-inf'))
 
-        attn = sim.softmax(dim=-1)
-        attn = F.dropout(attn, p=dropout, training=v.requires_grad)
-        out = torch.einsum('b h i j, b h j d -> b h i d', attn, v)
+        attn = sim.softmax(dim = -1)
+        attn = F.dropout(attn, p = dropout, training = v.requires_grad)
+        out = einsum('b h i j, b h j d -> b h i d', attn, v)
     else:
-        if causal and q_len < kv_len:
-            causal_mask = torch.ones((q_len, kv_len), dtype = torch.bool, device = device).tril(diagonal = kv_len - q_len)
-            attn_mask = and_masks(attn_mask, causal_mask)
-            causal = False
-
         out = F.scaled_dot_product_attention(
             q_pope, k_pope, v,
             attn_mask = attn_mask,

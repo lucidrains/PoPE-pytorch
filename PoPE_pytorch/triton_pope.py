@@ -369,9 +369,9 @@ class PoPESimilarityFunction(torch.autograd.Function):
         # expand freqs to (b, h, seq, rotate_dim) if needed
 
         if freqs.ndim == 2:
-            freqs = freqs.view(1, 1, freqs.shape[0], rotate_dim).expand(b, h, freqs.shape[0], rotate_dim)
+            freqs = repeat(freqs, 'n d -> b h n d', b = b, h = h)
         elif freqs.ndim == 3:
-            freqs = freqs.view(freqs.shape[0], 1, freqs.shape[1], rotate_dim).expand(b, h, freqs.shape[1], rotate_dim)
+            freqs = repeat(freqs, 'b n d -> b h n d', h = h)
 
         freqs = freqs.contiguous()
         sim = torch.empty((b, h, seq_q, seq_k), device = q.device, dtype = q.dtype)

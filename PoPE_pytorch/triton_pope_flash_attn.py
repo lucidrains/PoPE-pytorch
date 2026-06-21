@@ -22,9 +22,7 @@ def _max_shared_mem(device_idx = 0):
     return triton.runtime.driver.active.utils.get_device_properties(device_idx)['max_shared_mem']
 
 def _estimate_shared_bytes(bm, bn, blk_d, stages, elem_bytes):
-    """Conservative estimate of shared memory needed for a given block config.
-    Triton allocates well beyond the raw tile sizes for pipelining and
-    register spilling, so we use a 4x multiplier over the naive tile area."""
+    # conservative estimate of shared mem for a block config
     return (bm + bn) * blk_d * 4 * stages * elem_bytes
 
 def _filter_configs(configs, blk_d, elem_bytes, device_idx = 0):
@@ -57,13 +55,13 @@ def _fwd_configs():
     ]
 
 def _bwd_pre_hook(nargs):
-    """Zero atomic accumulation buffers before each autotuner benchmark run."""
+    # zero atomic accumulation buffers before autotune
     nargs['DQ'].zero_()
     df = nargs.get('DFreqs')
-    if df is not None:
+    if exists(df):
         df.zero_()
     dpb = nargs.get('DPopeBias')
-    if dpb is not None:
+    if exists(dpb):
         dpb.zero_()
 
 def _bwd_configs():
@@ -170,7 +168,7 @@ def _fwd_kernel(
         q_cos, q_sin = q, None
 
     if HAS_POS_MASK:
-        pos_m = tl.load(PosMask + off_m, mask=mask_m, other=0).to(tl.int1)
+        pos_m = tl.load(PosMask + off_m, mask = mask_m, other = 0).to(tl.int1)
 
     # online softmax accumulators
 
@@ -210,7 +208,7 @@ def _fwd_kernel(
         
         if HAS_POS_MASK:
             qk_unrot = tl.dot(q, tl.trans(k)) * softmax_scale
-            pos_k = tl.load(PosMask + col_n, mask=cmask, other=0).to(tl.int1)
+            pos_k = tl.load(PosMask + col_n, mask = cmask, other = 0).to(tl.int1)
             is_both = pos_m[:, None] & pos_k[None, :]
             qk = tl.where(is_both, qk_rot, qk_unrot)
         else:
@@ -348,7 +346,7 @@ def _bwd_kernel(
         k_cos, k_sin = k, None
         
     if HAS_POS_MASK:
-        pos_n = tl.load(PosMask + off_n, mask=mask_n, other=0).to(tl.int1)
+        pos_n = tl.load(PosMask + off_n, mask = mask_n, other = 0).to(tl.int1)
 
     # gradient accumulators
 
@@ -380,7 +378,7 @@ def _bwd_kernel(
         
         if HAS_POS_MASK:
             qk_unrot = tl.dot(q, tl.trans(k)) * softmax_scale
-            pos_m = tl.load(PosMask + cur_m, mask=mask_m, other=0).to(tl.int1)
+            pos_m = tl.load(PosMask + cur_m, mask = mask_m, other = 0).to(tl.int1)
             is_both = pos_m[:, None] & pos_n[None, :]
             qk = tl.where(is_both, qk_rot, qk_unrot)
         else:
@@ -626,7 +624,7 @@ def flash_attn_backward(do, q, k, v, o, lse, dq, dk, dv, dfreqs = None, dpope_bi
 class FlashAttnFunction(Function):
     @staticmethod
     def forward(ctx, q, k, v, freqs = None, pope_bias = None, mask = None, causal = False, softmax_scale = None, dropout = 0., pos_mask = None):
-        drop_seed = int(torch.randint(0, 2**31 - 1, (1,), device=q.device).item()) if dropout > 0. else 0
+        drop_seed = int(torch.randint(0, 2**31 - 1, (1,), device = q.device).item()) if dropout > 0. else 0
         o, lse = flash_attn_forward(q, k, v, freqs, pope_bias, mask, causal, softmax_scale, dropout, drop_seed, pos_mask)
         ctx.save_for_backward(q, k, v, freqs, pope_bias, mask, o, lse, pos_mask)
         ctx.causal = causal
@@ -652,5 +650,5 @@ class FlashAttnFunction(Function):
 # public api
 
 def flash_attn(q, k, v, freqs = None, pope_bias = None, mask = None, causal = False, softmax_scale = None, dropout = 0., pos_mask = None):
-    q, k, v = map(lambda t: t.contiguous(), (q, k, v))
+    q, k, v = (t.contiguous() for t in (q, k, v))
     return FlashAttnFunction.apply(q, k, v, freqs, pope_bias, mask, causal, softmax_scale, dropout, pos_mask)
