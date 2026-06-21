@@ -134,7 +134,12 @@ def flash_attn_with_pope(
 
     attn_mask = mask
     if exists(attn_mask):
-        attn_mask = rearrange(attn_mask, 'b j -> b 1 1 j')
+        if attn_mask.ndim == 2 and attn_mask.shape[0] == q_len and attn_mask.shape[1] == kv_len:
+            attn_mask = rearrange(attn_mask, 'i j -> 1 1 i j')
+        elif attn_mask.ndim == 2:
+            attn_mask = rearrange(attn_mask, 'b j -> b 1 1 j')
+        elif attn_mask.ndim == 3:
+            attn_mask = rearrange(attn_mask, 'b i j -> b 1 i j')
 
     pos_mask = None
 

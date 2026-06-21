@@ -86,8 +86,12 @@ def _freq_strides(freqs):
 
 def _mask_strides(mask):
     if not exists(mask):
-        return (0, 0)
-    return (mask.stride(0), mask.stride(1))
+        return (0, 0, 0, 0)
+    if mask.ndim == 2:
+        return (0, 0, mask.stride(0) if mask.shape[0] > 1 else 0, mask.stride(1) if mask.shape[1] > 1 else 0)
+    if mask.ndim == 3:
+        return (mask.stride(0) if mask.shape[0] > 1 else 0, 0, mask.stride(1) if mask.shape[1] > 1 else 0, mask.stride(2) if mask.shape[2] > 1 else 0)
+    return (mask.stride(0) if mask.shape[0] > 1 else 0, mask.stride(1) if mask.shape[1] > 1 else 0, mask.stride(2) if mask.shape[2] > 1 else 0, mask.stride(3) if mask.shape[3] > 1 else 0)
 
 # activation helpers
 
@@ -127,7 +131,7 @@ def _fwd_kernel(
     stride_fb, stride_fh, stride_fi,
     stride_pbh,
     stride_ob, stride_oh, stride_om,
-    stride_kmb, stride_kmn,
+    stride_mb, stride_mh, stride_mm, stride_mn,
     n_heads, seqlen_q, seqlen_k, headdim, rotate_dim, dropout_p, drop_seed,
     HAS_POPE: tl.constexpr, IS_CAUSAL: tl.constexpr, HAS_MASK: tl.constexpr, IS_DROPOUT: tl.constexpr, HAS_POS_MASK: tl.constexpr,
     BLOCK_HEADDIM: tl.constexpr, EVEN_M: tl.constexpr, EVEN_N: tl.constexpr, EVEN_HEADDIM: tl.constexpr,
@@ -158,7 +162,6 @@ def _fwd_kernel(
     # apply pope rotary to q
 
     q_off = seqlen_k - seqlen_q
-
 
     if HAS_POPE:
         q_act = _apply_softplus(q, mask_r)
@@ -220,8 +223,8 @@ def _fwd_kernel(
             qk += tl.where(off_m[:, None] + q_off >= col_n[None, :], 0, float('-inf'))
 
         if HAS_MASK:
-            mask = tl.load(Mask + b * stride_kmb + col_n * stride_kmn, mask = cmask, other = False)
-            qk += tl.where(mask[None, :], 0, float('-inf'))
+            mask = tl.load(Mask + b * stride_mb + h * stride_mh + off_m[:, None] * stride_mm + col_n[None, :] * stride_mn, mask = mask_m[:, None] & cmask[None, :], other = False)
+            qk += tl.where(mask, 0, float('-inf'))
 
         if not EVEN_N:
             qk += tl.where(cmask[None, :], 0, float('-inf'))
@@ -309,7 +312,7 @@ def _bwd_kernel(
     stride_dkb, stride_dkh, stride_dkn,
     stride_dvb, stride_dvh, stride_dvn,
     stride_dfb, stride_dfh, stride_dfi,
-    stride_kmb, stride_kmn,
+    stride_mb, stride_mh, stride_mm, stride_mn,
     n_heads, seqlen_q, seqlen_k, headdim, rotate_dim, dropout_p, drop_seed,
     HAS_POPE: tl.constexpr, IS_CAUSAL: tl.constexpr, HAS_MASK: tl.constexpr, IS_DROPOUT: tl.constexpr, HAS_POS_MASK: tl.constexpr,
     BLOCK_HEADDIM: tl.constexpr, EVEN_M: tl.constexpr, EVEN_N: tl.constexpr, EVEN_HEADDIM: tl.constexpr,
@@ -388,8 +391,8 @@ def _bwd_kernel(
             qk += tl.where(cur_m[:, None] + q_off >= off_n[None, :], 0, float('-inf'))
 
         if HAS_MASK:
-            mask = tl.load(Mask + b * stride_kmb + off_n * stride_kmn, mask = mask_n, other = False)
-            qk += tl.where(mask[None, :], 0, float('-inf'))
+            mask = tl.load(Mask + b * stride_mb + h * stride_mh + cur_m[:, None] * stride_mm + off_n[None, :] * stride_mn, mask = mask_m[:, None] & mask_n[None, :], other = False)
+            qk += tl.where(mask, 0, float('-inf'))
 
         # recompute prob from lse
 
