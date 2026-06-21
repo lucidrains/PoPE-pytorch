@@ -80,3 +80,26 @@ def test_flash_attn_with_pope(
     # assert equality
     
     assert allclose(out_triton, out_ref, atol = 5e-3)
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason = 'CUDA not available')
+def test_flash_attn_mask():
+    device = torch.device('cuda')
+
+    q = torch.randn(1, 4, 128, 64, device = device)
+    k = torch.randn(1, 4, 128, 64, device = device)
+    v = torch.randn(1, 4, 128, 64, device = device)
+
+    mask = torch.randint(0, 2, (1, 128, 128), device = device, dtype = torch.bool)
+
+    pope = PoPE(dim = 32, heads = 4).to(device)
+    pos_emb = pope(128)
+
+    out_ref = flash_attn_with_pope(
+        q, k, v, pos_emb = pos_emb, mask = mask, fused = False
+    )
+
+    out_tri = flash_attn_with_pope(
+        q, k, v, pos_emb = pos_emb, mask = mask, fused = True
+    )
+
+    assert allclose(out_ref, out_tri, atol = 5e-3)
