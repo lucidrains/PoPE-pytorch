@@ -1,13 +1,13 @@
-<img src="./pope.png" width="400px"></img>
+<img src="https://raw.githubusercontent.com/lucidrains/PoPE-pytorch/refs/heads/main/pope.png" width="400px" alt="Illustration comparing RoPE and PoPE from Figure 1 in the pre-print."></img>
 
-## PoPE-pytorch
+# PoPE-pytorch
 
-Efficient implementation (and explorations) into [polar coordinate positional embedding (PoPE)](https://arxiv.org/abs/2509.10534) - from [Gopalakrishnan](https://agopal42.github.io/) et al. under Schmidhuber
+Efficient implementation (and explorations) into [polar coordinate positional embedding (PoPE)](https://arxiv.org/abs/2509.10534) by [Gopalakrishnan](https://agopal42.github.io/) *et al.* under Schmidhuber.
 
 ## Install
 
 ```shell
-$ pip install PoPE-pytorch
+pip install PoPE-pytorch
 ```
 
 ## Usage
@@ -42,7 +42,7 @@ rotated_q, rotated_k = pope.apply_pope_to_qk(pos_emb, q[..., -1:, :], k)
 
 For images, video, etc. where multiple dimensions are needed, you can use `AxialPoPE`. The feature dimension will be split across these axial dimensions.
 
-You can either pass in the positions manually, or just pass the dimensions as a `tuple`, in which case the grid positions will be automatically generated.
+You can either pass in the positions manually or pass the dimensions as a `tuple`, in which case, the grid positions will be automatically generated.
 
 ```python
 import torch
