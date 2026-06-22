@@ -9,3 +9,11 @@ from PoPE_pytorch.attention import (
 from PoPE_pytorch.pope_nd import (
     AxialPoPE
 )
+
+__all__ = [
+    "PoPE",
+    "apply_pope_to_qk",
+    "compute_attn_similarity",
+    "flash_attn_with_pope",
+    "AxialPoPE"
+]

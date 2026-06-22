@@ -3,9 +3,9 @@ from collections import namedtuple
 from math import pi
 
 import torch
-from torch import arange, cat, stack, is_tensor, Tensor
+from torch import arange, cat, is_tensor, Tensor
 from torch.nn import Module, Parameter
-from torch.amp import autocast
+from torch.amp.autocast_mode import autocast
 
 import torch.nn.functional as F
 
@@ -21,9 +21,6 @@ PolarEmbedReturn = namedtuple('PolarEmbedReturn', ('freqs', 'bias'))
 
 def exists(v):
     return v is not None
-
-def default(v, d):
-    return v if exists(v) else d
 
 # applying pope to qk
 

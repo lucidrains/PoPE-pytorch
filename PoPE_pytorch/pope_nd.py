@@ -2,11 +2,11 @@ from __future__ import annotations
 from math import pi
 
 import torch
-from torch import arange, cat, stack, is_tensor, Tensor, meshgrid
+from torch import arange, cat, stack, Tensor, meshgrid
 from torch.nn import Module, Parameter, ParameterList
-from torch.amp import autocast
+from torch.amp.autocast_mode import autocast
 
-from einops import einsum, rearrange
+from einops import einsum
 
 from PoPE_pytorch.pope import PolarEmbedReturn, apply_pope_to_qk
 
@@ -14,9 +14,6 @@ from PoPE_pytorch.pope import PolarEmbedReturn, apply_pope_to_qk
 
 def exists(v):
     return v is not None
-
-def default(v, d):
-    return v if exists(v) else d
 
 # Axial PoPE class
 
